@@ -1,0 +1,27 @@
+# Inference / rollout / judge environment ("cosmos" conda env, Python 3.12, CUDA 13.x driver >= 580).
+# Create with:
+#   conda create -n cosmos python=3.12 && conda activate cosmos
+#   pip install -r requirements.txt
+#
+# Cosmos3OmniPipeline is not in a Diffusers release yet, so Diffusers is pinned to the git commit
+# this project was developed against.
+
+torch==2.15.0
+torchvision==0.29.2
+diffusers @ git+https://github.com/huggingface/diffusers.git@8edb6d8c9466313ff39d7d441474700ac2a442b1
+transformers==5.23.0
+tokenizers==0.23.3
+accelerate==1.16.0
+safetensors==0.8.0
+huggingface_hub>=2.4.0
+bitsandbytes==0.50.2          # 4-bit loading of the Qwen3.8-27B judge on a 24 GB GPU
+av==19.0.2
+imageio==2.38.2
+imageio-ffmpeg==0.8.1
+pillow==13.0.0
+numpy==2.5.5
+uv==0.11.29                    # used to build the separate post-training env (see README)
+
+# NOTE: Flow-DPO training does NOT run in this env. NVIDIA's cosmos-framework pins its own
+# Torch 2.11 / vLLM 0.23 / Transformers 4.57 stack and is installed into packages/cosmos-framework/.venv-posttrain
+# with uv (instructions in README.md, section "Setup").
