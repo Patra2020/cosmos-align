@@ -16,43 +16,18 @@ videos, using preferences produced by a **Qwen3.8-27B vision-language judge** in
 
 ---
 
-## Pipeline
+## Pipeline at a glance
+
+Five stages. The base model generates several videos per prompt, a VLM ranks them, the best and worst
+become training pairs, and Flow-DPO moves the model toward the winners. Everything is evaluated on clips
+the model never saw.
 
 ```mermaid
 flowchart LR
-    subgraph data[BridgeData2 subset]
-        T[1,222 train clips<br/>first frame + caption JSON]
-        V[51 val clips<br/>held out]
-    end
-
-    subgraph rollout[1. Rollouts]
-        G[Cosmos3-Edge base<br/>image-to-video]
-        T --> G
-        G -->|4 seeds per clip| C[~4,900 candidate videos]
-    end
-
-    subgraph judge[2. VLM judge]
-        Q[Qwen3.8-27B]
-        C --> Q
-        Q -->|4 scores + rationale| S[Scored candidates]
-    end
-
-    subgraph pairs[3. Preference pairs]
-        S -->|best vs worst<br/>same first frame| P[winner / loser JSONL<br/>filtered by score gap]
-    end
-
-    subgraph dpo[4. Flow-DPO]
-        R[Frozen reference<br/>= base Edge]
-        P --> D[Policy: Edge + LoRA]
-        R -.-> D
-        D --> M[Preference-optimized<br/>Cosmos3-Edge]
-    end
-
-    subgraph eval[5. Evaluation]
-        V --> E[Base vs DPO<br/>human + VLM + physics checks]
-        M --> E
-        G --> E
-    end
+    A["1. Generate<br/>4 videos per prompt"] --> B["2. Judge<br/>VLM scores each video"]
+    B --> C["3. Pair<br/>best vs worst"]
+    C --> D["4. Train<br/>Flow-DPO"]
+    D --> E["5. Evaluate<br/>base vs trained"]
 ```
 
 ### Why skip SFT
@@ -61,30 +36,35 @@ The project plan originally had an SFT stage. It is skipped here on purpose: the
 *preferences alone* can move a pretrained world model, and skipping SFT keeps the frozen reference equal
 to the public checkpoint, which makes the comparison clean. SFT can be added back later as an ablation.
 
-### How a preference pair is scored (Flow-DPO)
+---
+
+## Stage by stage
+
+### 1. Generate candidate videos
+
+Each BridgeData2 training clip gives a first frame and a structured caption. The unmodified Cosmos3-Edge
+turns that into four videos, one per random seed, all sharing the same starting image and instruction.
 
 ```mermaid
-flowchart TB
-    subgraph pair[One preference pair, same prompt and same first frame]
-        W[winner video] --> VAE1[Wan 2.2 VAE encode]
-        L[loser video] --> VAE2[Wan 2.2 VAE encode]
-    end
-    VAE1 --> N[Shared noise and timestep<br/>frame 0 kept clean - i2v conditioning]
-    VAE2 --> N
-    N --> PW[policy error on winner]
-    N --> RW[reference error on winner]
-    N --> PL[policy error on loser]
-    N --> RL[reference error on loser]
-    PW & RW & PL & RL --> LOSS["loss = -log σ( -β/2 · [ (e_pol_w − e_ref_w) − (e_pol_l − e_ref_l) ] )"]
+flowchart LR
+    F["First frame<br/>256×256 JPEG"] --> G["Cosmos3-Edge<br/>image-to-video"]
+    P["Caption JSON<br/>(task, objects, scene)"] --> G
+    G --> V1[seed 0] & V2[seed 1] & V3[seed 2] & V4[seed 3]
 ```
 
-The policy is pushed to denoise the winner better than the reference does, and the loser worse, relative
-to the frozen reference. Frame 0 is a conditioning frame: it stays clean and is excluded from the loss,
-so training matches image-to-video inference.
+1,222 clips × 4 seeds ≈ 4,900 candidate videos. The 51 validation clips are never used here.
 
-### Judge rubric
+### 2. Judge each video with a VLM
 
-Each candidate is scored 1–5 on four axes, with a short written rationale per axis:
+Qwen3.8-27B sees sampled frames of a candidate plus the caption and returns four 1–5 scores with a short
+rationale each.
+
+```mermaid
+flowchart LR
+    V["Candidate video<br/>(sampled frames)"] --> Q["Qwen3.8-27B<br/>vision-language judge"]
+    P["Caption"] --> Q
+    Q --> S["Task completion<br/>Object interaction<br/>Physical consistency<br/>Temporal coherence"]
+```
 
 | Axis | What the judge looks for |
 |---|---|
@@ -95,6 +75,62 @@ Each candidate is scored 1–5 on four axes, with a short written rationale per 
 
 Judge reliability is measured against a small set of independently annotated clips before the scores are
 used for training (planned, see Status).
+
+### 3. Build preference pairs
+
+Within each group of four videos, the highest-scoring one becomes the winner and the lowest the loser.
+Groups where the gap is small are discarded because the judge's preference there is noise.
+
+```mermaid
+flowchart LR
+    subgraph group["4 videos, same first frame + caption"]
+        direction TB
+        H["highest score"]
+        M1["…"]
+        L["lowest score"]
+    end
+    H --> W["winner"]
+    L --> X["loser"]
+    W & X --> J["pair kept only if<br/>score gap ≥ margin"]
+```
+
+Output is a JSONL manifest with the prompt, winner path, loser path, both scores and the gap, the format
+the cosmos-framework DPO dataset reads directly.
+
+### 4. Train with Flow-DPO
+
+Two copies of Cosmos3-Edge take part: a trainable policy with LoRA adapters on the video-generation
+pathway, and a frozen reference equal to the original checkpoint. For every pair the same noise is added
+to winner and loser, and the loss rewards the policy for denoising the winner better than the reference
+does and the loser worse.
+
+```mermaid
+flowchart TB
+    W["winner video"] --> N["same noise, same timestep<br/>frame 0 kept clean"]
+    L["loser video"] --> N
+    N --> POL["policy<br/>(Edge + LoRA)"]
+    N --> REF["reference<br/>(frozen Edge)"]
+    POL --> E1["error on winner, error on loser"]
+    REF --> E2["error on winner, error on loser"]
+    E1 & E2 --> LOSS["Flow-DPO loss<br/>prefer: policy beats reference on winner,<br/>loses to it on loser"]
+```
+
+Frame 0 is treated as a conditioning frame: it stays clean and is excluded from the loss, so training
+matches the image-to-video setting used at inference.
+
+### 5. Evaluate on held-out clips
+
+Base and trained models generate from the same 51 validation first frames with the same seeds, and are
+compared three ways.
+
+```mermaid
+flowchart LR
+    V["51 val first frames<br/>+ captions"] --> B["Base Edge"]
+    V --> T["DPO-trained Edge"]
+    B & T --> H["Human preference<br/>win rate"]
+    B & T --> Q["VLM scores<br/>(same rubric)"]
+    B & T --> P["Physics checks<br/>object persistence, contacts"]
+```
 
 ---
 
@@ -142,8 +178,9 @@ git clone https://github.com/NVIDIA/cosmos-framework.git packages/cosmos-framewo
 cd packages/cosmos-framework && git checkout 709ecd9
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv-posttrain"
 uv sync --frozen --no-default-groups
-uv sync --project docker/posttrain/environment --frozen --group cu130-runtime \
-        --active --inexact --python .venv-posttrain/bin/python
+# Do not use --active here: if your shell has another venv activated, uv will rebuild that one instead.
+env -u VIRTUAL_ENV uv sync --project docker/posttrain/environment --frozen --group cu130-runtime \
+        --inexact --python .venv-posttrain/bin/python
 ```
 
 ---
