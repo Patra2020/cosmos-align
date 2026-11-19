@@ -182,7 +182,7 @@ def main() -> None:
     n_ok = 0
     t_start = time.time()
     with open(manifest, "a") as mf:
-        for k, (it, seed) in enumerate(todo):
+        for it, seed in todo:
             clip = it["clip"]
             img_path = out_dir / "first_frames" / f"{clip}.jpg"
             if not img_path.exists():
