@@ -1,0 +1,106 @@
+Judge development log: Qwen3.8-27B as a scorer for generated robot videos
+===========================================================================
+
+Setting
+-------
+Judge: Qwen/Qwen3.8-27B loaded 4-bit (bitsandbytes NF4) on one RTX 4090, greedy decoding,
+thinking off. Script: scripts/judge_videos.py. Calibration set: the first 4 train clips x 4 seeds
+= 16 rollouts from the base Cosmos3-Edge (clips 000015, 000036, 000062, 000165), hand-scored
+from 8-frame contact sheets on the same four 1-5 axes (outputs/rollouts/train/manual_scores_v1.json).
+
+Every variant below was run on the same 16 videos. Agreement is reported as bias / mean absolute
+error against the hand scores per axis, and as "seed-order": within-clip pairwise ordering
+agreement of total score, which is the quantity preference-pair construction depends on.
+
+  variant            task        interact    physical    temporal   seed-order  latency
+  v1 2 frames      -0.31/1.44  -0.56/1.56  +1.88/1.88  +1.00/1.00    9/13       21 s
+  v2 video 512     +0.69/1.06  +0.56/1.06  +1.19/1.44  +0.69/0.94   12/20       43 s
+  v3 +mid frame    +0.75/1.00  +0.75/1.00  +0.94/1.31  +0.38/0.88   12/20       48 s
+  v4 frame images  +0.06/0.69  -0.25/0.88  +0.25/0.88   0.00/0.88   16/22       51 s
+
+v4 is the shipped default.
+
+
+Problem 1: the judge only saw two frames
+----------------------------------------
+Symptom. v1 gave physical consistency 4-5 to almost everything with reasons like "all objects
+remain present", on clips where most beads vanish after the first second. Its observations in v2
+said "across the two frames".
+
+Cause. Qwen3-VL's video processor assumes a 24 fps source when handed a pre-sampled list of frames.
+16 frames were interpreted as a 0.67 s clip and resampled to 2 frames at 0.1 s and 0.5 s
+(video_grid_thw [2,16,16]). Confirmed with a CPU-only processor test. The transformers warning
+about missing video_metadata is easy to miss in the load noise.
+
+Fix. Pass real timing metadata and disable resampling:
+  processor(text=[...], videos=[frames_uint8],
+            videos_kwargs={"video_metadata": [{"fps", "total_num_frames", "duration",
+                                               "frames_indices"}],
+                           "do_sample_frames": False})
+This yields grid_thw [8,32,32] for 16 frames at 512 px with timestamps 0.6 s ... 16.9 s. The script
+now raises if the processor keeps fewer frames than it was given.
+
+
+Problem 2: video mode cannot see small objects
+----------------------------------------------
+Symptom. With all 16 frames delivered (v2, v3), the judge caught single large objects appearing or
+vanishing (a blue block materialising, a lemon disappearing from a pot, a lemon teleporting) but
+still reported "no objects vanish" on the bead-scraping clip where the tray goes from ~60 beads to
+nearly empty.
+
+Cause. In video mode Qwen merges each pair of frames (temporal patch 2) and each 2x2 patch block
+into one token. A field of beads a few pixels wide becomes texture.
+
+Fix. Send each frame as a separately labelled image ("Frame k of 16 (t = .. s):") so every frame
+keeps its own 32x32 token grid with no temporal merging (~4.4k visual tokens per video instead of
+~2.1k). This was the single largest improvement: bias fell to about zero on every axis and the
+judge's anomalies field started reporting "individual beads disappear and are replaced by a single
+solid object" and "beads cluster into a pile without any visible contact". Frames are upscaled to
+512 px first so one token covers 16 px of the original 256 px frame.
+
+
+Problem 3: loose rubric
+-----------------------
+The first prompt gave one-line definitions and "1 = very bad, 5 = excellent". Replaced with
+anchored scales: each axis states what earns each of the five scores in checkable terms
+(e.g. physical consistency 3 = exactly one clear violation such as one object disappearing;
+2 = two or three violations or the manipulated object vanishing). Added decision rules: "touching"
+means the object is between or against the fingers, not merely below the gripper; when torn
+between two scores give the lower; a 5 requires no flaw found on that axis.
+
+
+Problem 4: scores not grounded in evidence
+------------------------------------------
+Added a mandatory observations block that the judge must fill before any score:
+  frame_1_objects, middle_frame_objects, last_frame_objects   (with approximate counts)
+  gripper_contact   (which frames, which object)
+  anomalies         (vanish / appear / duplicate / morph / teleport)
+with a hard rule: a count change over ~20%, an object missing in any later frame, or a new object
+caps physical consistency at 3 (2 if it is the manipulated object or many items vanished).
+Objects that vanish and later reappear count as a violation even if first and last frames match
+(this is why the middle frame was added in v3; on its own it did not help because of Problem 2).
+The observations are stored per video, so the judge can be audited on what it saw, not only on
+the final number.
+
+
+What still disagrees with the hand scores (v4)
+----------------------------------------------
+- Task credit for a related but not the described action: clip 000062 seed 2 moves the lemon into
+  the pot cleanly and gets task 4 / interaction 5; the caption says the arm lifts the pot first.
+  The judge rewards the visible manipulation, the hand score rewards following the caption.
+- One bead clip (000015 seed 0) still scored physical 5 where the hand score was 2 for mid-clip
+  thinning. The judge counted 40-50 beads at all three checkpoints.
+- Where the judge is harsher than the hand score it is usually defensible on inspection (e.g. rods
+  "grasped" without moving). These are rubric judgment calls, not perception failures.
+
+
+Cost and next step
+------------------
+~51 s per video unbatched (4-bit, bnb dequant on every forward, causal-conv1d fallback kernel).
+4,888 rollouts would take ~69 GPU-hours. Options in order of effort: left-padded batched generation
+(--batch-size, being measured), serving a pre-quantized AWQ/INT4 checkpoint with vLLM from the
+framework's venv, or a second GPU with --shard.
+
+Before the judge's scores are used for training, agreement should be re-measured on a larger
+held-out set labelled independently (the plan's "VLM-human agreement" metric), not on these 16
+videos that were used to tune the prompt.
