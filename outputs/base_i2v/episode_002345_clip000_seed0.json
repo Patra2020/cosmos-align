@@ -1,0 +1,14 @@
+{
+  "clip": "episode_002345_clip000",
+  "seed": 0,
+  "steps": 20,
+  "guidance": 6.0,
+  "width": 256,
+  "height": 256,
+  "num_frames": 93,
+  "fps": 5.0,
+  "generation_seconds": 12.1,
+  "peak_gpu_gb": 9.01,
+  "output": "/data/cosmos/outputs/base_i2v/episode_002345_clip000_seed0.mp4",
+  "reference_video": "/data/cosmos/BridgeData2/sft_dataset_bridge/val/videos/episode_002345_clip000.mp4"
+}
